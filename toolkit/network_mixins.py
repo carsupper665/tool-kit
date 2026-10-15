@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from collections import OrderedDict
 from typing import Optional, Union, List, Type, TYPE_CHECKING, Dict, Any, Literal
 
@@ -642,28 +643,50 @@ class ToolkitNetworkMixin:
             self: Network,
             file, dtype=torch.float16,
             metadata=None,
-            extra_state_dict: Optional[OrderedDict] = None
+            extra_state_dict: Optional[OrderedDict] = None,
+            timings: Optional[dict] = None,
     ):
+        # timings, if given, receives snapshot_ms / convert_ms / lora_write_ms
+        t = time.perf_counter()
         save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype)
-        
+        if timings is not None:
+            timings['snapshot_ms'] = (time.perf_counter() - t) * 1000
+
+        t = time.perf_counter()
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
         if metadata is None:
             metadata = OrderedDict()
         metadata = add_model_hash_to_meta(save_dict, metadata)
+        if timings is not None:
+            timings['convert_ms'] = (time.perf_counter() - t) * 1000
         # let the model handle the saving
-        
+
+        t = time.perf_counter()
         if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'save_lora'):
             # call the base model save lora method
             self.base_model_ref().save_lora(save_dict, file, metadata)
-            return
-        
-        if os.path.splitext(file)[1] == ".safetensors":
+        elif os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
             save_file(save_dict, file, metadata)
         else:
             torch.save(save_dict, file)
+        if timings is not None:
+            timings['lora_write_ms'] = (time.perf_counter() - t) * 1000
+
+    def get_lora_save_files(self: Network, save_dict, file):
+        """Split a LoRA state dict into the files save_weights() would write, as
+        [(path, state_dict)]. None if the model saves LoRAs in a way that cannot be
+        expressed as plain data (then only the synchronous save path is supported)."""
+        base_model = self.base_model_ref() if self.base_model_ref is not None else None
+        if base_model is not None and hasattr(base_model, 'split_lora_for_save'):
+            return base_model.split_lora_for_save(save_dict, file)
+        if base_model is not None and hasattr(base_model, 'save_lora'):
+            return None
+        if os.path.splitext(file)[1] != ".safetensors":
+            return None
+        return [(file, save_dict)]
 
     def load_weights(self: Network, file, force_weight_mapping=False):
         # allows us to save and load to and from ldm weights

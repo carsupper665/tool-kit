@@ -3,6 +3,7 @@ import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
+import { getUncommittedCheckpointFiles } from '@/server/checkpointManifests';
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
@@ -24,7 +25,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ files: [] });
   }
 
-  // find all safetensors files in the job folder
+  // find all safetensors files in the job folder, minus unfinished async checkpoints
+  const uncommitted = await getUncommittedCheckpointFiles(jobFolder);
   let files = (await fs.promises.readdir(jobFolder))
     .filter(file => {
       return file.endsWith('.safetensors');
@@ -32,6 +34,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     .map(file => {
       return path.join(jobFolder, file);
     })
+    .filter(file => !uncommitted.has(path.resolve(file)))
     .sort();
 
   // get the file size for each file (stat all in parallel)

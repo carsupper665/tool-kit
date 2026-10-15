@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import prisma from '@/server/prisma';
 import { getModelsPath, getTrainingFolder } from '@/server/settings';
+import { getUncommittedCheckpointFiles } from '@/server/checkpointManifests';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,7 +17,11 @@ interface LoraFile {
 const listSafetensors = async (dir: string): Promise<LoraFile[]> => {
   try {
     const entries = await fs.promises.readdir(dir, { withFileTypes: true });
-    const files = entries.filter(e => e.isFile() && e.name.endsWith('.safetensors'));
+    // unfinished async checkpoints are not loadable yet
+    const uncommitted = await getUncommittedCheckpointFiles(dir);
+    const files = entries.filter(
+      e => e.isFile() && e.name.endsWith('.safetensors') && !uncommitted.has(path.resolve(dir, e.name)),
+    );
     return (
       await Promise.all(
         files.map(async e => {

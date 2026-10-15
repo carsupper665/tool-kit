@@ -32,6 +32,42 @@ class SaveConfig:
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
 
+        # background checkpoint writer (toolkit/async_checkpoint.py). Off by default,
+        # in which case saving behaves exactly as before. A single background writer is
+        # used; when pending saves hit the limits below, training waits for them.
+        self.async_save: bool = kwargs.get("async_save", False)
+        # queued + in-flight saves the trainer may run ahead of the writer
+        self.max_pending_saves: int = kwargs.get("max_pending_saves", 2)
+        # cap for CPU snapshot memory held by pending saves. None = 1/4 of the RAM
+        # available when the writer starts (never unbounded)
+        self.max_pending_bytes: Optional[int] = kwargs.get("max_pending_bytes", None)
+        # async only: saves on these steps also store optimizer state (recovery). The other
+        # save_every steps are LoRA only previews. None = every save is a recovery save
+        self.optimizer_save_every: Optional[int] = kwargs.get("optimizer_save_every", None)
+        # async only: recovery groups whose optimizer state is kept
+        self.max_recovery_saves: int = kwargs.get("max_recovery_saves", 3)
+        # fsync files and directories on publish for power loss durability
+        self.fsync: bool = kwargs.get("fsync", True)
+        # wait for pending saves when the process exits
+        self.flush_on_exit: bool = kwargs.get("flush_on_exit", True)
+        # append per save timings to <save_root>/save_timings.jsonl
+        self.log_timings: bool = kwargs.get("log_timings", False)
+
+        if self.max_pending_saves < 1:
+            raise ValueError(f"save.max_pending_saves must be at least 1, got {self.max_pending_saves}")
+        if self.max_pending_bytes is not None and self.max_pending_bytes <= 0:
+            raise ValueError("save.max_pending_bytes must be positive or null")
+        if self.optimizer_save_every is not None:
+            if self.optimizer_save_every <= 0 or (
+                self.save_every and self.optimizer_save_every % self.save_every != 0
+            ):
+                raise ValueError(
+                    f"save.optimizer_save_every ({self.optimizer_save_every}) must be a positive "
+                    f"multiple of save.save_every ({self.save_every})"
+                )
+        if self.max_recovery_saves < 1:
+            raise ValueError("save.max_recovery_saves must be at least 1")
+
 class LoggingConfig:
     def __init__(self, **kwargs):
         self.log_every: int = kwargs.get('log_every', 100)

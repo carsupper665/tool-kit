@@ -4,6 +4,7 @@ import inspect
 import json
 import random
 import shutil
+import time
 from collections import OrderedDict
 import os
 import re
@@ -55,7 +56,7 @@ from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 
 from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
-    parse_metadata_from_safetensors
+    parse_metadata_from_safetensors, add_model_hash_to_meta
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
 import gc
 
@@ -68,6 +69,7 @@ from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
 from toolkit.print import print_acc
+from toolkit import async_checkpoint
 from accelerate import Accelerator
 import transformers
 import diffusers
@@ -272,6 +274,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
         self.additional_logs = {}
+        # background checkpoint writer, created on the first async save
+        self._async_checkpoints: Optional[async_checkpoint.AsyncCheckpointManager] = None
+        self._async_save_fallback_logged = False
+        # resolved from completed checkpoint manifests when async_save is on
+        self._async_resume: Optional[dict] = None
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
 
@@ -503,10 +510,219 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    def on_error(self, e: Exception):
+        # pending snapshots are consistent, so write them out before the process dies
+        try:
+            self._close_async_checkpoints(drain=True)
+        except Exception as close_error:
+            print_acc(f"Error while flushing async checkpoints: {close_error}")
+        super().on_error(e)
+
+    # ------------------------------------------------------------------
+    # async checkpoints (toolkit/async_checkpoint.py)
+    # ------------------------------------------------------------------
+
+    def _async_save_unsupported_reason(self) -> Optional[str]:
+        # None means LoRA saves can go through the background writer
+        if self.network is None:
+            return "no LoRA network is being trained"
+        if self.is_fine_tuning:
+            return "full fine tuning"
+        if self.train_config.merge_network_on_save:
+            return "merge_network_on_save is enabled"
+        if self.embedding is not None:
+            return "embedding training"
+        if self.decorator is not None:
+            return "decorator training"
+        if self.adapter is not None and self.adapter_config is not None and self.adapter_config.train:
+            return "adapter training"
+        if self.network.get_lora_save_files(OrderedDict(), 'probe.safetensors') is None:
+            return f"{self.sd.__class__.__name__} saves LoRAs with a custom save_lora()"
+        return None
+
+    def _use_async_lora_save(self) -> bool:
+        if not self.save_config.async_save:
+            return False
+        reason = self._async_save_unsupported_reason()
+        if reason is not None:
+            if not self._async_save_fallback_logged:
+                print_acc(f"async_save: falling back to synchronous saving ({reason})")
+                self._async_save_fallback_logged = True
+            return False
+        return True
+
+    def _get_async_checkpoints(self) -> async_checkpoint.AsyncCheckpointManager:
+        if self._async_checkpoints is None:
+            num_saves_to_keep = self.save_config.max_step_saves_to_keep
+            self._async_checkpoints = async_checkpoint.AsyncCheckpointManager(
+                self.save_root,
+                max_pending_saves=self.save_config.max_pending_saves,
+                max_pending_bytes=self.save_config.max_pending_bytes,
+                keep_lora_groups=num_saves_to_keep,
+                keep_recovery_groups=self.save_config.max_recovery_saves,
+                metadata_hasher=add_model_hash_to_meta,
+                fsync=self.save_config.fsync,
+                flush_on_exit=self.save_config.flush_on_exit,
+                timings_path=self._get_save_timings_path(),
+                log=print_acc,
+            )
+            print_acc(
+                f"async_save: background checkpoint writer started "
+                f"(max_pending_saves={self._async_checkpoints.max_pending_saves}, "
+                f"max_pending_bytes={self._async_checkpoints.max_pending_bytes / 1024 ** 3:.2f} GiB)"
+            )
+        return self._async_checkpoints
+
+    def _close_async_checkpoints(self, drain=True):
+        manager = self._async_checkpoints
+        if manager is None:
+            return
+        self._async_checkpoints = None
+        if drain and manager.pending_count > 0:
+            print_acc(f"Waiting for {manager.pending_count} pending checkpoint save(s)...")
+        manager.close(drain=drain)
+
+    def _get_save_timings_path(self):
+        if not self.save_config.log_timings:
+            return None
+        return os.path.join(self.save_root, 'save_timings.jsonl')
+
+    def _is_recovery_save_step(self, step) -> bool:
+        if step is None:
+            # the final save can always be resumed from
+            return True
+        every = self.save_config.optimizer_save_every
+        return not every or step % every == 0
+
+    def _submit_async_lora_checkpoint(
+        self,
+        file_path: str,
+        save_meta,
+        checkpoint_type: str,
+        include_optimizer: bool,
+    ):
+        """Snapshot the LoRA (and optimizer state for recovery saves) to CPU on this thread
+        and hand it to the background writer. Must be called at an optimizer step boundary."""
+        manager = self._get_async_checkpoints()
+        dtype = get_torch_dtype(self.save_config.dtype)
+        timings = {}
+
+        optimizer_state = None
+        if include_optimizer and self.optimizer is not None:
+            try:
+                optimizer_state = unwrap_model(self.optimizer).state_dict()
+            except Exception:
+                optimizer_state = self.optimizer.state_dict()
+
+        # make room before allocating the snapshot
+        nbytes = async_checkpoint.estimate_nbytes(self.network.state_dict(), dtype)
+        if optimizer_state is not None:
+            nbytes += async_checkpoint.estimate_nbytes(optimizer_state)
+        t = time.perf_counter()
+        write_now = not manager.make_room(nbytes)
+        if write_now:
+            print_acc(
+                f"async_save: snapshot of {nbytes / 1024 ** 3:.2f} GiB exceeds max_pending_bytes, "
+                f"writing it synchronously"
+            )
+        timings['queue_wait_ms'] = (time.perf_counter() - t) * 1000
+
+        try:
+            t = time.perf_counter()
+            prev_multiplier = self.network.multiplier
+            self.network.multiplier = 1.0
+            try:
+                save_dict = self.network.get_state_dict(dtype=dtype)
+            finally:
+                self.network.multiplier = prev_multiplier
+            files = [
+                async_checkpoint.CheckpointFile(
+                    rel_path=os.path.relpath(path, self.save_root),
+                    role=async_checkpoint.ROLE_LORA,
+                    tensors=tensors,
+                )
+                for path, tensors in self.network.get_lora_save_files(save_dict, file_path)
+            ]
+            group = os.path.splitext(os.path.basename(file_path))[0]
+            if optimizer_state is not None:
+                files.append(async_checkpoint.CheckpointFile(
+                    rel_path=os.path.join(async_checkpoint.CHECKPOINT_DIR, group, 'optimizer.pt'),
+                    role=async_checkpoint.ROLE_OPTIMIZER,
+                    obj=async_checkpoint.snapshot_to_cpu(optimizer_state),
+                ))
+            del optimizer_state
+            timings['snapshot_ms'] = (time.perf_counter() - t) * 1000
+
+            request = async_checkpoint.CheckpointRequest(
+                group=group,
+                step=self.step_num,
+                checkpoint_type=checkpoint_type,
+                files=files,
+                lora_metadata=save_meta,
+                hash_source=save_dict,
+                epoch=self.epoch_num,
+                job_name=self.job.name,
+                model_arch=getattr(self.sd, 'arch', None),
+                nbytes=nbytes,
+                producer_timings=timings,
+            )
+        except BaseException:
+            if not write_now:
+                manager.release(nbytes)
+            raise
+
+        if write_now:
+            manager.write_now(request)
+        else:
+            manager.submit(request)
+
+    def _resolve_async_resume(self):
+        """Pick what to resume from using completed checkpoint manifests. Leaves
+        self._async_resume as None to use the legacy (newest file + optimizer.pt) lookup."""
+        if self.accelerator.is_main_process:
+            async_checkpoint.recover_incomplete(self.save_root, log=print_acc)
+        self.accelerator.wait_for_everyone()
+        self._async_resume = None
+        if not self.save_config.async_save:
+            return
+        if self.network_config is None or self.train_config.merge_network_on_save:
+            # only LoRA saves go through the async writer
+            return
+
+        recovery = async_checkpoint.find_latest_recovery(self.save_root)
+        if recovery is not None:
+            lora_file = async_checkpoint.manifest_files(recovery, async_checkpoint.ROLE_LORA)[0]
+            optimizer_file = async_checkpoint.manifest_files(recovery, async_checkpoint.ROLE_OPTIMIZER)[0]
+            self._async_resume = {
+                'group': recovery['group'],
+                'step': recovery['step'],
+                'lora_path': os.path.join(self.save_root, lora_file['path']),
+                'optimizer_path': os.path.join(self.save_root, optimizer_file['path']),
+            }
+            print_acc(f"async_save: resuming from recovery checkpoint {recovery['group']} (step {recovery['step']})")
+            return
+
+        latest = async_checkpoint.find_latest_lora(self.save_root)
+        if latest is not None:
+            lora_file = async_checkpoint.manifest_files(latest, async_checkpoint.ROLE_LORA)[0]
+            self._async_resume = {
+                'group': latest['group'],
+                'step': latest['step'],
+                'lora_path': os.path.join(self.save_root, lora_file['path']),
+                'optimizer_path': None,
+            }
+            print_acc(
+                f"async_save: no complete recovery checkpoint found, resuming LoRA weights from "
+                f"{latest['group']} (step {latest['step']}) with a fresh optimizer state"
+            )
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
         flush()
+        use_async = self._use_async_lora_save()
+        save_started = time.perf_counter()
+        sync_timings = {} if self.save_config.log_timings and not use_async else None
         if self.ema is not None:
             # always save params as ema
             self.ema.eval()
@@ -546,14 +762,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 prev_multiplier = self.network.multiplier
                 self.network.multiplier = 1.0
 
-                # if we are doing embedding training as well, add that
-                embedding_dict = self.embedding.state_dict() if self.embedding else None
-                self.network.save_weights(
-                    file_path,
-                    dtype=get_torch_dtype(self.save_config.dtype),
-                    metadata=save_meta,
-                    extra_state_dict=embedding_dict
-                )
+                if use_async:
+                    is_recovery = self._is_recovery_save_step(step)
+                    self._submit_async_lora_checkpoint(
+                        file_path,
+                        save_meta,
+                        checkpoint_type=(
+                            async_checkpoint.CHECKPOINT_TYPE_RECOVERY if is_recovery
+                            else async_checkpoint.CHECKPOINT_TYPE_PREVIEW
+                        ),
+                        include_optimizer=is_recovery,
+                    )
+                else:
+                    # if we are doing embedding training as well, add that
+                    embedding_dict = self.embedding.state_dict() if self.embedding else None
+                    self.network.save_weights(
+                        file_path,
+                        dtype=get_torch_dtype(self.save_config.dtype),
+                        metadata=save_meta,
+                        extra_state_dict=embedding_dict,
+                        timings=sync_timings,
+                    )
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
@@ -697,10 +926,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with open(path_to_save, 'w') as f:
                 json.dump(json_data, f, indent=4)
         
-        print_acc(f"Saved checkpoint to {file_path}")
+        if use_async:
+            print_acc(f"Queued checkpoint {file_path}")
+        else:
+            print_acc(f"Saved checkpoint to {file_path}")
 
-        # save optimizer
-        if self.optimizer is not None:
+        # save optimizer. async saves carry it in their recovery checkpoint instead
+        if self.optimizer is not None and not use_async:
+            t = time.perf_counter()
             try:
                 filename = f'optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
@@ -713,13 +946,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
             except Exception as e:
                 print_acc(e)
                 print_acc("Could not save optimizer")
+            if sync_timings is not None:
+                sync_timings['optimizer_write_ms'] = (time.perf_counter() - t) * 1000
 
-        self.clean_up_saves()
+        # the async writer does group based cleanup after each commit
+        if not use_async:
+            t = time.perf_counter()
+            self.clean_up_saves()
+            if sync_timings is not None:
+                sync_timings['cleanup_ms'] = (time.perf_counter() - t) * 1000
         self.post_save_hook(file_path)
 
         if self.ema is not None:
             self.ema.train()
+
+        if step is None:
+            # training is done, wait for every pending checkpoint to be published
+            self._close_async_checkpoints(drain=True)
         flush()
+
+        if self.save_config.log_timings:
+            record = {
+                'time': time.time(),
+                'kind': 'save_call',
+                'mode': 'async' if use_async else 'sync',
+                'step': self.step_num,
+                'save_blocking_ms': round((time.perf_counter() - save_started) * 1000, 3),
+            }
+            if sync_timings is not None:
+                record.update({k: round(v, 3) for k, v in sync_timings.items()})
+            async_checkpoint.append_timing_record(self._get_save_timings_path(), record)
 
     # Called before the model is loaded
     def hook_before_model_load(self):
@@ -1727,6 +1983,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         ### HOOK ###
         self.hook_before_model_load()
+        # roll back half written async checkpoints and pick the async resume point
+        self._resolve_async_resume()
         model_config_to_load = copy.deepcopy(self.model_config)
 
         if self.is_fine_tuning or self.train_config.merge_network_on_save:
@@ -2024,7 +2282,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.named_lora:
                     lora_name = f"{lora_name}_LoRA"
 
-                latest_save_path = self.get_latest_save_path(lora_name)
+                if self._async_resume is not None:
+                    # only a completed checkpoint group, see _resolve_async_resume()
+                    latest_save_path = self._async_resume['lora_path']
+                else:
+                    latest_save_path = self.get_latest_save_path(lora_name)
                 extra_weights = None
                 if latest_save_path is not None and not self.train_config.merge_network_on_save:
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
@@ -2168,7 +2430,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if os.path.exists(optimizer_state_file_path):
+        if self._async_resume is not None:
+            # the optimizer state that belongs to the resumed LoRA step, or none at all.
+            # never pair the weights with an optimizer.pt from another step
+            optimizer_state_file_path = self._async_resume['optimizer_path']
+        if optimizer_state_file_path is not None and os.path.exists(optimizer_state_file_path):
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
