@@ -41,8 +41,4 @@ class TrainJob(BaseJob):
         print(f"Running  {len(self.process)} process{'' if len(self.process) == 1 else 'es'}")
 
         for process in self.process:
-            try:
-                process.run()
-            except Exception as e:
-                process.on_error(e)
-                raise
+            process.run()
