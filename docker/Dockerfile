@@ -91,7 +91,7 @@ RUN cd /app/ai-toolkit/ui && npm ci
 ARG CACHEBUST=1234
 ARG GIT_COMMIT=main
 RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git /tmp/ai-toolkit-src && \
+    git clone https://github.com/carsupper665/tool-kit.git /tmp/ai-toolkit-src && \
     cd /tmp/ai-toolkit-src && \
     git checkout ${GIT_COMMIT} && \
     rsync -a --delete \

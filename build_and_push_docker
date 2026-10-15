@@ -12,21 +12,25 @@ else
     exit 1
 fi
 
+IMAGE=carsupper666/ai-kit-clone
+# the image clones this commit from GitHub, so it has to be pushed first
+GIT_COMMIT=$(git rev-parse HEAD)
+
 echo "Docker builds from the repo, not this dir. Make sure changes are pushed to the repo."
-echo "Building version: $VERSION and latest"
+echo "Building version: $VERSION and latest from commit $GIT_COMMIT"
 # wait 2 seconds
 sleep 2
 
 # Build the image with cache busting
-docker build --build-arg CACHEBUST=$(date +%s) -t aitoolkit:$VERSION -f docker/Dockerfile .
+docker build --build-arg CACHEBUST=$(date +%s) --build-arg GIT_COMMIT=$GIT_COMMIT -t aitoolkit:$VERSION -f docker/Dockerfile .
 
 # Tag with version and latest
-docker tag aitoolkit:$VERSION ostris/aitoolkit:$VERSION
-docker tag aitoolkit:$VERSION ostris/aitoolkit:latest
+docker tag aitoolkit:$VERSION $IMAGE:$VERSION
+docker tag aitoolkit:$VERSION $IMAGE:latest
 
 # Push both tags
 echo "Pushing images to Docker Hub..."
-docker push ostris/aitoolkit:$VERSION
-docker push ostris/aitoolkit:latest
+docker push $IMAGE:$VERSION
+docker push $IMAGE:latest
 
-echo "Successfully built and pushed ostris/aitoolkit:$VERSION and ostris/aitoolkit:latest"
+echo "Successfully built and pushed $IMAGE:$VERSION and $IMAGE:latest"
