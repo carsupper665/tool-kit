@@ -51,6 +51,11 @@ WORKDIR /app
 # Set aliases for python and pip
 RUN ln -s /usr/bin/python3 /usr/bin/python
 
+# tolerate slow / stalling connections on the large wheel downloads below
+# (set after the apt layers so they stay cached)
+ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_RETRIES=10
+
 # install pytorch before cache bust to avoid redownloading pytorch
 # (versions must match manager/spec.py — the AI Toolkit Manager's linux spec)
 RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
