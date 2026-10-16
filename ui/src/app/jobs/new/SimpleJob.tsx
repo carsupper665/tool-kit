@@ -699,6 +699,13 @@ export default function SimpleJob({
               min={1}
               required
             />
+            <Checkbox
+              label="Async Save"
+              className="pt-2"
+              docKey="save.async_save"
+              checked={jobConfig.config.process[0].save.async_save || false}
+              onChange={value => setJobConfig(value, 'config.process[0].save.async_save')}
+            />
           </Card>
         </div>
         <div>

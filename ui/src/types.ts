@@ -105,6 +105,7 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  async_save?: boolean;
 }
 
 export interface DatasetConfig {

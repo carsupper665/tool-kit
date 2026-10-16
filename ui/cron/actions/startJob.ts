@@ -181,7 +181,8 @@ const startAndWatchJob = (job: Job) => {
     const jobID = job.id;
 
     // setup the training
-    const trainingRoot = await getTrainingFolder();
+    // absolute, since the job runs with cwd TOOLKIT_ROOT, not this worker's cwd
+    const trainingRoot = path.resolve(await getTrainingFolder());
 
     const trainingFolder = path.join(trainingRoot, job.name);
     if (!fs.existsSync(trainingFolder)) {
@@ -217,6 +218,10 @@ const startAndWatchJob = (job: Job) => {
     // update the config dataset path
     const jobConfig = JSON.parse(job.job_config);
     jobConfig.config.process[0].sqlite_db_path = path.join(TOOLKIT_ROOT, 'aitk_db.db');
+    // the current Training Folder setting wins over whatever the job was saved with,
+    // so the trainer's outputs (model, optimizer, loss_log.db, config.yaml) land
+    // next to log.txt and .job_config.json instead of in the old/default folder
+    jobConfig.config.process[0].training_folder = trainingRoot;
     if (job.job_type === 'inference') {
       // the engine publishes engine.json (endpoint + token) and writes its
       // outputs under the job folder, which the UI proxy/file routes know

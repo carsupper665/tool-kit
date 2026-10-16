@@ -65,6 +65,7 @@ export const defaultJobConfig: JobConfig = {
           max_step_saves_to_keep: 4,
           save_format: 'diffusers',
           push_to_hub: false,
+          async_save: true,
         },
         datasets: [defaultDatasetConfig],
         train: {

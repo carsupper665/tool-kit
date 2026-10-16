@@ -2978,7 +2978,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         # print above the progress bar
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
-                        print_acc(f"\nSaving at step {self.step_num}")
+                        if self._use_async_lora_save():
+                            print_acc(f"\nQueueing background save at step {self.step_num}")
+                        else:
+                            print_acc(f"\nSaving at step {self.step_num}")
                         self.save(self.step_num)
                         self.ensure_params_requires_grad()
                         # clear any grads

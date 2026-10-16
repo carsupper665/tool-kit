@@ -374,6 +374,18 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'save.async_save': {
+    title: 'Async Save',
+    description: (
+      <>
+        Writes checkpoints from a background writer so training keeps going while the LoRA is saved. Training only
+        pauses to copy the weights (and optimizer state) to CPU memory, then continues. If the pending saves pile up,
+        training waits for them. Only LoRA training supports it; other jobs fall back to normal saving and say so in
+        the log. In the advanced config, <code>save.optimizer_save_every</code> (a multiple of Save Every) limits which
+        saves also store the optimizer, which makes the other saves lighter.
+      </>
+    ),
+  },
   'model.model_kwargs.kv_cache': {
     title: 'KV Cache',
     description: (
